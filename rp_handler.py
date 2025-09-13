@@ -1,9 +1,20 @@
-import os, sys, time, json, base64, subprocess, socket, threading
+import os
+import sys
+import time
+import json
+import base64
+import socket
+import threading
+import subprocess
 from pathlib import Path
+
 import requests
 import runpod  # RunPod SDK
 
-# --- config paths ---
+
+# ---------------------------
+# Paths / Env
+# ---------------------------
 COMFY_REPO = Path("/workspace/ComfyUI")
 PY = str(COMFY_REPO / ".venv/bin/python")
 
@@ -11,7 +22,6 @@ MODELS_DIR = Path(os.getenv("COMFYUI_MODEL_DIR", "/runpod-volume/models"))
 OUT_DIR = Path(os.getenv("COMFYUI_OUT_DIR", "/runpod-volume/out"))
 MANIFEST = Path("/workspace/model_manifest.txt")
 
-# S3 env vars
 S3_BUCKET = os.getenv("S3_BUCKET")
 S3_PREFIX = os.getenv("S3_PREFIX", "models/")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
@@ -19,13 +29,18 @@ AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 COMFY_PORT = int(os.getenv("COMFY_PORT", "8188"))
 
 
-# --- logging helper ---
+# ---------------------------
+# Logging
+# ---------------------------
 def log(msg: str):
-    sys.stdout.write(f"[rp][{time.time():7.2f}] {msg}\n")
+    # monotonic-ish seconds in bracket for quick scanning
+    sys.stdout.write(f"[rp][{time.time():.2f}] {msg}\n")
     sys.stdout.flush()
 
 
-# --- sync from S3 (cold start) ---
+# ---------------------------
+# S3 sync (ignores comments/blank lines)
+# ---------------------------
 def sync_models_from_s3():
     if not S3_BUCKET:
         log("no S3_BUCKET set, skipping model sync")
@@ -35,6 +50,7 @@ def sync_models_from_s3():
         return
 
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
+
     with MANIFEST.open() as f:
         for raw in f:
             line = raw.strip()
@@ -52,6 +68,7 @@ def sync_models_from_s3():
             s3_uri = f"s3://{S3_BUCKET}/{S3_PREFIX}{relpath}"
             log(f"fetching {s3_uri} -> {dest}")
             try:
+                # capture output to keep logs clean; show concise error if it fails
                 subprocess.run(
                     ["aws", "s3", "cp", s3_uri, str(dest), "--region", AWS_REGION],
                     check=True,
@@ -59,79 +76,71 @@ def sync_models_from_s3():
                     capture_output=True,
                 )
             except subprocess.CalledProcessError as e:
-                # Show a concise error; keep going on other files
-                err = (e.stderr or e.stdout or "").strip()[:500]
-                log(f"ERROR fetching {s3_uri}: rc={e.returncode} :: {err}")
+                err = (e.stderr or e.stdout or "").strip()
+                log(f"ERROR fetching {s3_uri}: rc={e.returncode} :: {err[:500]}")
 
 
-
-# --- comfyui server helpers ---
-def _wait_for_port_or_crash(proc, host, port, timeout=240.0):
-    """Wait until port opens or the process exits; return True if open, False if crash/timeout."""
-    t0 = time.time()
-    last_err = []
-    while time.time() - t0 < timeout:
-        # if process exited, dump stderr and bail
-        rc = proc.poll()
-        if rc is not None:
-            # read whatever is available
+# ---------------------------
+# ComfyUI server helpers
+# ---------------------------
+def _ensure_models_symlink():
+    """Ensure ComfyUI/models -> /runpod-volume/models for predictable discovery."""
+    try:
+        target = Path("/runpod-volume/models")
+        link = COMFY_REPO / "models"
+        if link.exists():
+            if link.is_symlink():
+                return
+            # Replace real dir with symlink (best-effort)
             try:
-                err = proc.stderr.read()
-                if err:
-                    sys.stderr.write(err[-4000:] + ("\n[rp] ... (stderr truncated)\n" if len(err) > 4000 else "\n"))
+                for p in link.glob("*"):
+                    if p.is_file():
+                        p.unlink(missing_ok=True)
+                link.rmdir()
             except Exception:
                 pass
-            log(f"server exited early rc={rc}")
-            return False
-        # try connecting
-        with socket.socket() as s:
-            s.settimeout(1.0)
-            try:
-                s.connect((host, port))
-                return True
-            except OSError:
-                time.sleep(0.5)
-    # timeout: show some stderr to help debug slow boots
-    try:
-        err = proc.stderr.read()
-        if err:
-            sys.stderr.write(err[-4000:] + ("\n[rp] ... (stderr truncated)\n" if len(err) > 4000 else "\n"))
-    except Exception:
-        pass
-    return False
+        os.symlink(str(target), str(link))
+        log("created symlink ComfyUI/models -> /runpod-volume/models")
+    except Exception as e:
+        log(f"symlink warn: {e}")
 
+
+def _write_extra_model_paths_yaml():
+    """Write extra_model_paths.yaml to point Comfy directly at the volume."""
+    try:
+        yaml_text = (
+            "models:\n"
+            "  checkpoints: /runpod-volume/models/checkpoints\n"
+            "  clip: /runpod-volume/models/clip\n"
+            "  upscale_models: /runpod-volume/models/upscale_models\n"
+            "  embeddings: /runpod-volume/models/embeddings\n"
+            "  loras: /runpod-volume/models/loras\n"
+            "  controlnet: /runpod-volume/models/controlnet\n"
+            "  vae: /runpod-volume/models/vae\n"
+        )
+        (COMFY_REPO / "extra_model_paths.yaml").write_text(yaml_text)
+        log("wrote extra_model_paths.yaml")
+    except Exception as e:
+        log(f"warn: could not write extra_model_paths.yaml: {e}")
 
 
 def _start_server():
     env = os.environ.copy()
     env["COMFYUI_MODEL_DIR"] = str(MODELS_DIR)
 
-    # Ensure ComfyUI/models points at the volume to simplify discovery
-    try:
-        target = Path("/runpod-volume/models")
-        link = COMFY_REPO / "models"
-        if link.exists() and link.is_symlink():
-            pass
-        elif link.exists() and not link.is_symlink():
-            # If a real dir exists, remove it and replace with symlink
-            for p in link.glob("*"):
-                try:
-                    if p.is_file(): p.unlink()
-                except Exception:
-                    pass
-            link.rmdir()
-            os.symlink(str(target), str(link))
-        else:
-            os.symlink(str(target), str(link))
-    except Exception as e:
-        log(f"symlink warn: {e}")
+    _ensure_models_symlink()
+    _write_extra_model_paths_yaml()
 
     cmd = [
-        PY, str(COMFY_REPO / "main.py"),
+        PY,
+        str(COMFY_REPO / "main.py"),
         "--disable-auto-launch",
-        "--listen", "127.0.0.1",
-        "--port", str(COMFY_PORT),
-        "--output-directory", str(OUT_DIR),
+        "--listen",
+        "127.0.0.1",
+        "--port",
+        str(COMFY_PORT),
+        "--output-directory",
+        str(OUT_DIR),
     ]
     log(f"starting ComfyUI server: {' '.join(cmd)}")
     return subprocess.Popen(
@@ -143,10 +152,51 @@ def _start_server():
     )
 
 
-# --- workflow runner ---
+def _wait_for_port_or_crash(proc, host, port, timeout=240.0):
+    """Wait until port opens or the process exits; return True if open, else False."""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        # Check if process died early
+        rc = proc.poll()
+        if rc is not None:
+            try:
+                err = proc.stderr.read()
+                if err:
+                    tail = err[-4000:]
+                    sys.stderr.write(tail + ("\n[rp] ... (stderr truncated)\n" if len(err) > 4000 else "\n"))
+                    sys.stderr.flush()
+            except Exception:
+                pass
+            log(f"server exited early rc={rc}")
+            return False
+
+        # Try to connect
+        with socket.socket() as s:
+            s.settimeout(1.0)
+            try:
+                s.connect((host, port))
+                return True
+            except OSError:
+                time.sleep(0.5)
+
+    # Timeout: show some stderr to aid debugging
+    try:
+        err = proc.stderr.read()
+        if err:
+            tail = err[-4000:]
+            sys.stderr.write(tail + ("\n[rp] ... (stderr truncated)\n" if len(err) > 4000 else "\n"))
+            sys.stderr.flush()
+    except Exception:
+        pass
+    return False
+
+
+# ---------------------------
+# Workflow runner
+# ---------------------------
 def run_comfy_workflow(workflow_json: dict) -> dict:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    # clear previous outputs
+    # Clear previous outputs
     for p in OUT_DIR.glob("*"):
         if p.is_file():
             try:
@@ -156,102 +206,112 @@ def run_comfy_workflow(workflow_json: dict) -> dict:
 
     proc = _start_server()
 
-    # background log tail
+    # Background tail (best-effort; avoid buffering logs forever)
     def _pipe(stream, target):
         for line in iter(stream.readline, ""):
             if not line:
                 break
-            target.write(line)
-            target.flush()
+            try:
+                target.write(line)
+                target.flush()
+            except Exception:
+                break
 
     threading.Thread(target=_pipe, args=(proc.stdout, sys.stdout), daemon=True).start()
     threading.Thread(target=_pipe, args=(proc.stderr, sys.stderr), daemon=True).start()
 
+    # Give the server time to come up and index models
     if not _wait_for_port_or_crash(proc, "127.0.0.1", COMFY_PORT, timeout=240):
-    try:
-        proc.kill()
-    except Exception:
-        pass
-    raise RuntimeError("ComfyUI server did not open port")
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        raise RuntimeError("ComfyUI server did not open port")
 
-    # submit workflow
+    # Small settle time for first model scan
+    time.sleep(2.0)
+
+    # Submit prompt
     url = f"http://127.0.0.1:{COMFY_PORT}/prompt"
     payload = {"prompt": workflow_json}
     log(f"POST {url}")
-    r = requests.post(url, json=payload, timeout=30)
+    r = requests.post(url, json=payload, timeout=45)
     if r.status_code != 200:
-        proc.kill()
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
         raise RuntimeError(f"submit failed: {r.status_code} {r.text[:500]}")
 
-    # wait for outputs
+    # Poll OUT_DIR for images
     t0 = time.time()
-    imgs = []
+    exts = {".png", ".jpg", ".jpeg", ".webp"}
+    images = []
     while time.time() - t0 < 300:
-        imgs = [
-            p
-            for p in OUT_DIR.glob("**/*")
-            if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
-        ]
-        if imgs:
+        images = [p for p in OUT_DIR.glob("**/*") if p.suffix.lower() in exts]
+        if images:
             break
         time.sleep(0.5)
 
-    # shutdown server
+    # Shutdown server
     try:
         proc.terminate()
         proc.wait(timeout=5)
     except Exception:
         proc.kill()
 
-    # collect images
-    imgs = sorted(imgs, key=lambda p: p.stat().st_mtime, reverse=True)
-    result = []
-    for p in imgs[:8]:
+    # Collect up to 8 newest images
+    images = sorted(images, key=lambda p: p.stat().st_mtime, reverse=True)
+    payload_imgs = []
+    for p in images[:8]:
         try:
-            result.append(
-                {
-                    "filename": p.name,
-                    "b64": base64.b64encode(p.read_bytes()).decode("utf-8"),
-                }
+            payload_imgs.append(
+                {"filename": p.name, "b64": base64.b64encode(p.read_bytes()).decode("utf-8")}
             )
         except Exception as e:
             log(f"warn: failed to encode {p}: {e}")
 
-    if not result:
+    log(f"collected {len(payload_imgs)} image(s) from {OUT_DIR}")
+    if not payload_imgs:
         raise RuntimeError("no images produced; check server stderr above")
 
-    return {"images": result}
+    return {"images": payload_imgs}
 
 
-# --- runpod handler ---
+# ---------------------------
+# RunPod handler
+# ---------------------------
 def handler(job):
-    """RunPod entrypoint"""
+    """RunPod serverless handler."""
     t0 = time.time()
     inp = job.get("input", {})
     log(f"handler start, keys={list(inp.keys())}")
 
+    # Ensure models are present (fast no-op if cached)
     sync_models_from_s3()
 
     workflow_json = inp.get("workflow")
+    if workflow_json is None:
+        raise ValueError("no workflow provided (expected input.workflow)")
     if isinstance(workflow_json, str):
         try:
             workflow_json = json.loads(workflow_json)
         except Exception as e:
-            raise ValueError(f"invalid workflow JSON: {e}")
+            raise ValueError(f"invalid workflow JSON string: {e}")
 
-    if not workflow_json:
-        raise ValueError("no workflow provided")
-
-    out = run_comfy_workflow(workflow_json)
-    out["execution_time"] = round(time.time() - t0, 2)
-    return out
+    result = run_comfy_workflow(workflow_json)
+    result["execution_time"] = round(time.time() - t0, 2)
+    return result
 
 
-# --- main ---
+# ---------------------------
+# Main
+# ---------------------------
 if __name__ == "__main__":
     log(f"boot: image_version={os.getenv('IMAGE_VERSION','unknown')}")
     log(f"boot: model_dir={MODELS_DIR}")
     log(f"boot: out_dir={OUT_DIR}")
     log(f"boot: bucket={S3_BUCKET} prefix={S3_PREFIX} region={AWS_REGION}")
+    # Start RunPod loop
     runpod.serverless.start({"handler": handler})
-
