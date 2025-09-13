@@ -66,9 +66,24 @@ def sync_models_from_s3():
 
 
 # --- comfyui server helpers ---
-def _wait_for_port(host, port, timeout=60.0):
+def _wait_for_port_or_crash(proc, host, port, timeout=240.0):
+    """Wait until port opens or the process exits; return True if open, False if crash/timeout."""
     t0 = time.time()
+    last_err = []
     while time.time() - t0 < timeout:
+        # if process exited, dump stderr and bail
+        rc = proc.poll()
+        if rc is not None:
+            # read whatever is available
+            try:
+                err = proc.stderr.read()
+                if err:
+                    sys.stderr.write(err[-4000:] + ("\n[rp] ... (stderr truncated)\n" if len(err) > 4000 else "\n"))
+            except Exception:
+                pass
+            log(f"server exited early rc={rc}")
+            return False
+        # try connecting
         with socket.socket() as s:
             s.settimeout(1.0)
             try:
@@ -76,17 +91,37 @@ def _wait_for_port(host, port, timeout=60.0):
                 return True
             except OSError:
                 time.sleep(0.5)
+    # timeout: show some stderr to help debug slow boots
+    try:
+        err = proc.stderr.read()
+        if err:
+            sys.stderr.write(err[-4000:] + ("\n[rp] ... (stderr truncated)\n" if len(err) > 4000 else "\n"))
+    except Exception:
+        pass
     return False
+
 
 
 def _start_server():
     env = os.environ.copy()
-    env["COMFYUI_MODEL_DIR"] = str(MODELS_DIR)  # fine to keep
-    # ensure ComfyUI/models -> /runpod-volume/models symlink as a fallback
+    env["COMFYUI_MODEL_DIR"] = str(MODELS_DIR)
+
+    # Ensure ComfyUI/models points at the volume to simplify discovery
     try:
         target = Path("/runpod-volume/models")
         link = COMFY_REPO / "models"
-        if not link.exists() and target.exists():
+        if link.exists() and link.is_symlink():
+            pass
+        elif link.exists() and not link.is_symlink():
+            # If a real dir exists, remove it and replace with symlink
+            for p in link.glob("*"):
+                try:
+                    if p.is_file(): p.unlink()
+                except Exception:
+                    pass
+            link.rmdir()
+            os.symlink(str(target), str(link))
+        else:
             os.symlink(str(target), str(link))
     except Exception as e:
         log(f"symlink warn: {e}")
@@ -97,11 +132,15 @@ def _start_server():
         "--listen", "127.0.0.1",
         "--port", str(COMFY_PORT),
         "--output-directory", str(OUT_DIR),
-        "--base-directory", "/runpod-volume"     # <-- add this
     ]
     log(f"starting ComfyUI server: {' '.join(cmd)}")
-    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
-
+    return subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
 
 
 # --- workflow runner ---
@@ -128,9 +167,12 @@ def run_comfy_workflow(workflow_json: dict) -> dict:
     threading.Thread(target=_pipe, args=(proc.stdout, sys.stdout), daemon=True).start()
     threading.Thread(target=_pipe, args=(proc.stderr, sys.stderr), daemon=True).start()
 
-    if not _wait_for_port("127.0.0.1", COMFY_PORT, timeout=60):
+    if not _wait_for_port_or_crash(proc, "127.0.0.1", COMFY_PORT, timeout=240):
+    try:
         proc.kill()
-        raise RuntimeError("ComfyUI server did not open port")
+    except Exception:
+        pass
+    raise RuntimeError("ComfyUI server did not open port")
 
     # submit workflow
     url = f"http://127.0.0.1:{COMFY_PORT}/prompt"
