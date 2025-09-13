@@ -1,7 +1,62 @@
-import socket, requests, threading
+import os, sys, time, json, base64, subprocess, socket, threading
+from pathlib import Path
+import requests
+import runpod  # RunPod SDK
+
+# --- config paths ---
+COMFY_REPO = Path("/workspace/ComfyUI")
+PY = str(COMFY_REPO / ".venv/bin/python")
+
+MODELS_DIR = Path(os.getenv("COMFYUI_MODEL_DIR", "/runpod-volume/models"))
+OUT_DIR = Path(os.getenv("COMFYUI_OUT_DIR", "/runpod-volume/out"))
+MANIFEST = Path("/workspace/model_manifest.txt")
+
+# S3 env vars
+S3_BUCKET = os.getenv("S3_BUCKET")
+S3_PREFIX = os.getenv("S3_PREFIX", "models/")
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 
 COMFY_PORT = int(os.getenv("COMFY_PORT", "8188"))
 
+
+# --- logging helper ---
+def log(msg: str):
+    sys.stdout.write(f"[rp][{time.time():7.2f}] {msg}\n")
+    sys.stdout.flush()
+
+
+# --- sync from S3 (cold start) ---
+def sync_models_from_s3():
+    if not S3_BUCKET:
+        log("no S3_BUCKET set, skipping model sync")
+        return
+
+    if not MANIFEST.exists():
+        log("no model_manifest.txt, skipping model sync")
+        return
+
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    with MANIFEST.open() as f:
+        entries = [ln.strip() for ln in f if ln.strip()]
+
+    for relpath in entries:
+        local = MODELS_DIR / relpath
+        if local.exists():
+            log(f"cache hit: {local}")
+            continue
+        local.parent.mkdir(parents=True, exist_ok=True)
+        s3_uri = f"s3://{S3_BUCKET}/{S3_PREFIX}{relpath}"
+        log(f"fetching {s3_uri} -> {local}")
+        try:
+            subprocess.run(
+                ["aws", "s3", "cp", s3_uri, str(local), "--region", AWS_REGION],
+                check=True,
+            )
+        except subprocess.CalledProcessError as e:
+            log(f"ERROR fetching {s3_uri}: {e}")
+
+
+# --- comfyui server helpers ---
 def _wait_for_port(host, port, timeout=60.0):
     t0 = time.time()
     while time.time() - t0 < timeout:
@@ -14,86 +69,137 @@ def _wait_for_port(host, port, timeout=60.0):
                 time.sleep(0.5)
     return False
 
+
 def _start_server():
-    # Run ComfyUI headless server (no UI) in the venv
     env = os.environ.copy()
     env["COMFYUI_MODEL_DIR"] = str(MODELS_DIR)
     cmd = [
-        PY, str(COMFY_REPO / "main.py"),
+        PY,
+        str(COMFY_REPO / "main.py"),
         "--disable-auto-launch",
-        "--listen", "127.0.0.1",
-        "--port", str(COMFY_PORT),
-        "--output-directory", str(OUT_DIR),
+        "--listen",
+        "127.0.0.1",
+        "--port",
+        str(COMFY_PORT),
+        "--output-directory",
+        str(OUT_DIR),
     ]
     log(f"starting ComfyUI server: {' '.join(cmd)}")
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
-    return proc
+    return subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
 
+
+# --- workflow runner ---
 def run_comfy_workflow(workflow_json: dict) -> dict:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    # Clean previous files
+    # clear previous outputs
     for p in OUT_DIR.glob("*"):
-        try:
-            if p.is_file():
+        if p.is_file():
+            try:
                 p.unlink()
-        except Exception as e:
-            log(f"warn: could not remove {p}: {e}")
+            except Exception as e:
+                log(f"warn: could not remove {p}: {e}")
 
-    # Boot server
     proc = _start_server()
-    # Background log tail (non-blocking, truncated)
-    def _pipe(name, stream):
-        for i, line in enumerate(iter(stream.readline, '')):
-            if i < 200:  # keep logs light
-                sys.stdout.write(line if name=='stdout' else "")
-                sys.stderr.write(line if name=='stderr' else "")
-    threading.Thread(target=_pipe, args=("stdout", proc.stdout), daemon=True).start()
-    threading.Thread(target=_pipe, args=("stderr", proc.stderr), daemon=True).start()
+
+    # background log tail
+    def _pipe(stream, target):
+        for line in iter(stream.readline, ""):
+            if not line:
+                break
+            target.write(line)
+            target.flush()
+
+    threading.Thread(target=_pipe, args=(proc.stdout, sys.stdout), daemon=True).start()
+    threading.Thread(target=_pipe, args=(proc.stderr, sys.stderr), daemon=True).start()
 
     if not _wait_for_port("127.0.0.1", COMFY_PORT, timeout=60):
         proc.kill()
-        raise RuntimeError("ComfyUI server did not open port in time")
+        raise RuntimeError("ComfyUI server did not open port")
 
-    # Submit workflow to API
+    # submit workflow
     url = f"http://127.0.0.1:{COMFY_PORT}/prompt"
     payload = {"prompt": workflow_json}
     log(f"POST {url}")
     r = requests.post(url, json=payload, timeout=30)
     if r.status_code != 200:
         proc.kill()
-        raise RuntimeError(f"submit failed: {r.status_code} {r.text[:2000]}")
+        raise RuntimeError(f"submit failed: {r.status_code} {r.text[:500]}")
 
-    # Poll for outputs: simplest is to watch the OUT_DIR for new files
-    # (Alternatively use /history or /queue endpoints; dir watch is robust.)
+    # wait for outputs
     t0 = time.time()
-    images_prev = set()
+    imgs = []
     while time.time() - t0 < 300:
-        images = {p for p in OUT_DIR.glob("**/*") if p.suffix.lower() in {".png",".jpg",".jpeg",".webp"}}
-        new = images - images_prev
-        if new:
+        imgs = [
+            p
+            for p in OUT_DIR.glob("**/*")
+            if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+        ]
+        if imgs:
             break
-        images_prev = images
         time.sleep(0.5)
 
-    # Shutdown server
+    # shutdown server
     try:
         proc.terminate()
         proc.wait(timeout=5)
     except Exception:
         proc.kill()
 
-    # Collect images
-    images = sorted(
-        (p for p in OUT_DIR.glob("**/*") if p.suffix.lower() in {".png",".jpg",".jpeg",".webp"}),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    payload = []
-    for p in images[:8]:
-        with p.open("rb") as f:
-            payload.append({"filename": p.name, "b64": base64.b64encode(f.read()).decode("utf-8")})
-    log(f"collected {len(payload)} image(s) from {OUT_DIR}")
-    if not payload:
+    # collect images
+    imgs = sorted(imgs, key=lambda p: p.stat().st_mtime, reverse=True)
+    result = []
+    for p in imgs[:8]:
+        try:
+            result.append(
+                {
+                    "filename": p.name,
+                    "b64": base64.b64encode(p.read_bytes()).decode("utf-8"),
+                }
+            )
+        except Exception as e:
+            log(f"warn: failed to encode {p}: {e}")
+
+    if not result:
         raise RuntimeError("no images produced; check server stderr above")
-    return {"images": payload}
+
+    return {"images": result}
+
+
+# --- runpod handler ---
+def handler(job):
+    """RunPod entrypoint"""
+    t0 = time.time()
+    inp = job.get("input", {})
+    log(f"handler start, keys={list(inp.keys())}")
+
+    sync_models_from_s3()
+
+    workflow_json = inp.get("workflow")
+    if isinstance(workflow_json, str):
+        try:
+            workflow_json = json.loads(workflow_json)
+        except Exception as e:
+            raise ValueError(f"invalid workflow JSON: {e}")
+
+    if not workflow_json:
+        raise ValueError("no workflow provided")
+
+    out = run_comfy_workflow(workflow_json)
+    out["execution_time"] = round(time.time() - t0, 2)
+    return out
+
+
+# --- main ---
+if __name__ == "__main__":
+    log(f"boot: image_version={os.getenv('IMAGE_VERSION','unknown')}")
+    log(f"boot: model_dir={MODELS_DIR}")
+    log(f"boot: out_dir={OUT_DIR}")
+    log(f"boot: bucket={S3_BUCKET} prefix={S3_PREFIX} region={AWS_REGION}")
+    runpod.serverless.start({"handler": handler})
 
