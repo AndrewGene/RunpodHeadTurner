@@ -31,7 +31,7 @@ jobs:
       - name: Derive tags
         id: meta
         run: |
-          TAG=v7.1
+          TAG=v7.0
           echo "TAG=${TAG}" >> $GITHUB_OUTPUT
           echo "LATEST=true" >> $GITHUB_OUTPUT
 
@@ -48,4 +48,9 @@ jobs:
             docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.TAG }}       
           cache-from: type=registry,ref=docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:buildcache
           cache-to: type=registry,ref=docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+     - name: Cleanup docker
+       run: |
+         docker system prune -af
+         docker builder prune -af
 
