@@ -3,7 +3,7 @@
 # =========================
 FROM runpod/base:0.6.2-cuda12.1.0 AS comfyui-base
 
-ARG IMAGE_VERSION=v6.1
+ARG IMAGE_VERSION=v6.4
 ENV IMAGE_VERSION=${IMAGE_VERSION}
 
 # System deps
@@ -30,7 +30,7 @@ RUN python3 -m venv .venv
 # toolchain
 RUN . .venv/bin/activate && python -m pip install --upgrade pip setuptools wheel
 
-# PyTorch for CUDA 12.1 (keep torchaudio if you need it)
+# PyTorch for CUDA 12.1 (include torchaudio only if you need it)
 RUN . .venv/bin/activate && \
     pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu121 \
         torch==2.3.1 torchvision==0.18.1 torchaudio==2.3.1
@@ -54,8 +54,8 @@ RUN . .venv/bin/activate && \
       opencv-python-headless==4.9.0.80 \
       insightface==0.7.3
 
-# RunPod SDK (required for Queue endpoints)
-RUN . .venv/bin/activate && pip install --no-cache-dir runpod
+# RunPod SDK (required for Queue endpoints) + requests (for HTTP API driving)
+RUN . .venv/bin/activate && pip install --no-cache-dir runpod requests
 
 # Make 'comfy' importable WITHOUT packaging:
 # 1) Add repo to PYTHONPATH at runtime
@@ -89,6 +89,6 @@ WORKDIR /workspace
 COPY model_manifest.txt /workspace/model_manifest.txt
 COPY rp_handler.py      /workspace/rp_handler.py
 
-# Entrypoint: use the venv interpreter so all deps (incl. runpod) are on sys.path
+# Entrypoint: use the venv interpreter so all deps (incl. runpod/requests) are on sys.path
 CMD ["/workspace/ComfyUI/.venv/bin/python", "/workspace/rp_handler.py"]
 
