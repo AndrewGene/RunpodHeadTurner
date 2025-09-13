@@ -12,14 +12,15 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      # Free a lot of disk on the hosted runner
+      # Free space BEFORE starting BuildKit to avoid restart loops
       - name: Pre-clean runner disk
         run: |
           sudo rm -rf /usr/local/lib/android || true
@@ -28,12 +29,15 @@ jobs:
           docker system prune -af || true
           docker builder prune -af || true
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+      # QEMU not needed if you only build amd64; drop it to reduce moving parts
+      # - name: Set up QEMU
+      #   uses: docker/setup-qemu-action@v3
 
-      - name: Set up Buildx (with GC)
+      - name: Set up Buildx (fresh builder each run)
         uses: docker/setup-buildx-action@v3
         with:
+          install: true
+          cleanup: true
           driver-opts: |
             image=moby/buildkit:v0.13.1
           buildkitd-flags: --oci-worker-gc=true --oci-worker-gc-keepstorage=8GB
@@ -45,11 +49,10 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Derive tags
+      - name: Derive tag
         id: meta
         run: |
-          TAG=v7.3
-          echo "TAG=${TAG}" >> $GITHUB_OUTPUT
+          echo "TAG=v7.4" >> $GITHUB_OUTPUT
 
       - name: Build & Push (linux/amd64)
         uses: docker/build-push-action@v6
@@ -63,7 +66,7 @@ jobs:
           outputs: type=registry,compression=zstd,force-compression=true
           tags: docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.TAG }}
           cache-from: type=registry,ref=docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:buildcache
-          cache-to: type=registry,ref=docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+          cache-to:   type=registry,ref=docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
 
       - name: Post-clean docker
         if: always()
