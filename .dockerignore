@@ -1,0 +1,11 @@
+.git
+__pycache__/
+*.log
+*.png
+*.jpg
+*.jpeg
+*.webp
+node_modules/
+venv/
+.env
+

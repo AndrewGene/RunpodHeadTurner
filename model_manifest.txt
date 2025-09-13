@@ -1,0 +1,20 @@
+# base model(s)
+checkpoints/Chroma-Rapid-AIO-v2.safetensors
+
+# face detection / parsing
+facedetection/detection_Resnet50_Final.pth
+facedetection/parsing_parsenet.pth
+
+# face restore
+facerestore_models/GFPGANv1.3.pth
+facerestore_models/GFPGANv1.4.pth
+facerestore_models/codeformer-v0.1.0.pth
+
+# insightface (inswapper + buffalo_l pack)
+insightface/inswapper_128.onnx
+insightface/models/buffalo_l/1k3d68.onnx
+insightface/models/buffalo_l/2d106det.onnx
+insightface/models/buffalo_l/det_10g.onnx
+insightface/models/buffalo_l/genderage.onnx
+insightface/models/buffalo_l/w600k_r50.onnx
+
