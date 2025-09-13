@@ -30,30 +30,39 @@ def sync_models_from_s3():
     if not S3_BUCKET:
         log("no S3_BUCKET set, skipping model sync")
         return
-
     if not MANIFEST.exists():
         log("no model_manifest.txt, skipping model sync")
         return
 
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     with MANIFEST.open() as f:
-        entries = [ln.strip() for ln in f if ln.strip()]
+        for raw in f:
+            line = raw.strip()
+            # ignore blanks and comments
+            if not line or line.startswith("#"):
+                continue
 
-    for relpath in entries:
-        local = MODELS_DIR / relpath
-        if local.exists():
-            log(f"cache hit: {local}")
-            continue
-        local.parent.mkdir(parents=True, exist_ok=True)
-        s3_uri = f"s3://{S3_BUCKET}/{S3_PREFIX}{relpath}"
-        log(f"fetching {s3_uri} -> {local}")
-        try:
-            subprocess.run(
-                ["aws", "s3", "cp", s3_uri, str(local), "--region", AWS_REGION],
-                check=True,
-            )
-        except subprocess.CalledProcessError as e:
-            log(f"ERROR fetching {s3_uri}: {e}")
+            relpath = line
+            dest = MODELS_DIR / relpath
+            if dest.exists():
+                log(f"cache hit: {dest}")
+                continue
+
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            s3_uri = f"s3://{S3_BUCKET}/{S3_PREFIX}{relpath}"
+            log(f"fetching {s3_uri} -> {dest}")
+            try:
+                subprocess.run(
+                    ["aws", "s3", "cp", s3_uri, str(dest), "--region", AWS_REGION],
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                )
+            except subprocess.CalledProcessError as e:
+                # Show a concise error; keep going on other files
+                err = (e.stderr or e.stdout or "").strip()[:500]
+                log(f"ERROR fetching {s3_uri}: rc={e.returncode} :: {err}")
+
 
 
 # --- comfyui server helpers ---
