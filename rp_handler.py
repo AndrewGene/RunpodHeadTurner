@@ -170,7 +170,6 @@ except Exception as e:
     # Don’t crash the process—let the handler return error details.
     # (If you prefer hard-fail, re-raise here.)
 # ---------- Handler ----------
-@runpod.serverless.functions.handler
 def handler(event):
     log(f"handler: event keys = {list((event or {}).keys())}")
     try:

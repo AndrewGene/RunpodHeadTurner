@@ -1,47 +1,50 @@
-# ---------- Base: CUDA 12.1 (compatible with RunPod pools) ----------
+# CUDA 12.1 base compatible with most RunPod pools
 FROM runpod/base:0.6.2-cuda12.1.0
 
-ARG IMAGE_VERSION=v4.4
+ARG IMAGE_VERSION=v5.0
 ENV IMAGE_VERSION=${IMAGE_VERSION}
 
-# ---------- System deps ----------
+# System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git ffmpeg wget unzip ca-certificates python3-venv build-essential && \
     rm -rf /var/lib/apt/lists/*
 
-# Ensure `python` is available (some bases only have python3)
+# Make sure /usr/bin/python exists
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
-# ---------- AWS CLI v2 (for S3 pulls on cold start) ----------
+# AWS CLI v2
 RUN wget -q https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -O /tmp/awscliv2.zip && \
     unzip /tmp/awscliv2.zip -d /tmp && /tmp/aws/install && \
     rm -rf /tmp/aws /tmp/awscliv2.zip
 
-# ---------- ComfyUI (headless) ----------
+# ---------- ComfyUI ----------
 WORKDIR /workspace
 RUN git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git
-
 WORKDIR /workspace/ComfyUI
 
 # venv
 RUN python3 -m venv .venv
 
-# Upgrade build tooling first
-RUN . .venv/bin/activate && \
-    python -m pip install --upgrade pip setuptools wheel
+# Upgrade pip/setuptools/wheel
+RUN . .venv/bin/activate && python -m pip install --upgrade pip setuptools wheel
 
-# CUDA 12.1–matched PyTorch (no torchaudio to save size)
+# CUDA 12.1–matched PyTorch
 RUN . .venv/bin/activate && \
     pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu121 \
-        torch==2.3.1 torchvision==0.18.1
+        torch==2.3.1 torchvision==0.18.1 torchaudio==2.3.1
 
 # ComfyUI requirements (should not re-pin torch)
-RUN . .venv/bin/activate && \
-    pip install --no-cache-dir -r requirements.txt
+RUN . .venv/bin/activate && pip install --no-cache-dir -r requirements.txt
 
-# RunPod SDK only (no extra heavy packages)
+# Faceswap / facerestore deps + RunPod SDK
 RUN . .venv/bin/activate && \
-    pip install --no-cache-dir runpod && \
+    pip install --no-cache-dir \
+        gfpgan==1.4.0 \
+        facexlib==0.3.0 \
+        opencv-python-headless==4.9.0.80 \
+        insightface==0.7.3 \
+        onnxruntime-gpu==1.17.1 \
+        runpod && \
     rm -rf /root/.cache/pip /root/.cache
 
 # ---------- Runtime env ----------
@@ -55,5 +58,6 @@ COPY model_manifest.txt /workspace/model_manifest.txt
 COPY rp_handler.py      /workspace/rp_handler.py
 
 # ---------- Entrypoint ----------
-CMD ["python3", "/workspace/rp_handler.py"]
+# Run inside the venv so all deps (incl. runpod) are visible
+CMD ["/workspace/ComfyUI/.venv/bin/python", "/workspace/rp_handler.py"]
 
