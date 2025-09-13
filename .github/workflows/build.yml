@@ -31,7 +31,7 @@ jobs:
       - name: Derive tags
         id: meta
         run: |
-          TAG=v6.8
+          TAG=v6.9
           echo "TAG=${TAG}" >> $GITHUB_OUTPUT
           echo "LATEST=true" >> $GITHUB_OUTPUT
 

@@ -81,26 +81,27 @@ def _wait_for_port(host, port, timeout=60.0):
 
 def _start_server():
     env = os.environ.copy()
-    env["COMFYUI_MODEL_DIR"] = str(MODELS_DIR)
+    env["COMFYUI_MODEL_DIR"] = str(MODELS_DIR)  # fine to keep
+    # ensure ComfyUI/models -> /runpod-volume/models symlink as a fallback
+    try:
+        target = Path("/runpod-volume/models")
+        link = COMFY_REPO / "models"
+        if not link.exists() and target.exists():
+            os.symlink(str(target), str(link))
+    except Exception as e:
+        log(f"symlink warn: {e}")
+
     cmd = [
-        PY,
-        str(COMFY_REPO / "main.py"),
+        PY, str(COMFY_REPO / "main.py"),
         "--disable-auto-launch",
-        "--listen",
-        "127.0.0.1",
-        "--port",
-        str(COMFY_PORT),
-        "--output-directory",
-        str(OUT_DIR),
+        "--listen", "127.0.0.1",
+        "--port", str(COMFY_PORT),
+        "--output-directory", str(OUT_DIR),
+        "--base-directory", "/runpod-volume"     # <-- add this
     ]
     log(f"starting ComfyUI server: {' '.join(cmd)}")
-    return subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=env,
-    )
+    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+
 
 
 # --- workflow runner ---
