@@ -6,62 +6,50 @@ import base64
 import subprocess
 from pathlib import Path
 
-import runpod  # provided by runpod/base image
+import runpod  # required by RunPod Queue endpoints
 
 # ---------- Config ----------
 MODELS_DIR = Path(os.getenv("COMFYUI_MODEL_DIR", "/runpod-volume/models"))
+OUT_DIR    = Path(os.getenv("COMFYUI_OUT_DIR", "/runpod-volume/out"))
+COMFY_REPO = Path("/workspace/ComfyUI")
+VENV       = COMFY_REPO / ".venv"
+PY         = str(VENV / "bin/python")
+
 MANIFEST   = Path("/workspace/model_manifest.txt")
 
 S3_BUCKET  = os.getenv("S3_BUCKET", "")
 S3_PREFIX  = os.getenv("S3_PREFIX", "models/")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 
-COMFY_REPO = Path("/workspace/ComfyUI")
-VENV       = COMFY_REPO / ".venv"
-PY         = str(VENV / "bin/python")
-
-# Persist outputs so you can inspect them between runs if desired.
-OUT_DIR    = Path(os.getenv("COMFYUI_OUT_DIR", "/runpod-volume/out"))
-
 IMAGE_VERSION = os.getenv("IMAGE_VERSION", "unset")
 ENABLE_AWS_DIAG = os.getenv("AWS_DIAG", "0") == "1"   # set AWS_DIAG=1 to print STS + ls
 
-# ---------- Logging helpers ----------
+# ---------- Logging ----------
 _t0 = time.time()
 def log(msg: str):
     dt = time.time() - _t0
     print(f"[rp][{dt:7.2f}s] {msg}", flush=True)
 
-def run(cmd, check=True, capture=False, env=None):
-    """Subprocess wrapper with logging."""
+def _run(cmd, *, capture=True, env=None):
+    """Run a command with logging; returns CompletedProcess."""
     log(f"$ {' '.join(cmd)}")
+    res = subprocess.run(cmd, capture_output=capture, text=True, env=env)
+    log(f"rc={res.returncode}")
     if capture:
-        res = subprocess.run(cmd, check=False, text=True, capture_output=True, env=env)
         if res.stdout:
-            sys.stdout.write(res.stdout[:2000])  # cap noisy outputs
-            if len(res.stdout) > 2000:
-                sys.stdout.write("\n[rp] ... (stdout truncated)\n")
+            sys.stdout.write(res.stdout[:2000] + ("\n[rp] ... (stdout truncated)\n" if len(res.stdout) > 2000 else "\n"))
         if res.stderr:
-            sys.stderr.write(res.stderr[:2000])
-            if len(res.stderr) > 2000:
-                sys.stderr.write("\n[rp] ... (stderr truncated)\n")
-        if check and res.returncode != 0:
-            raise subprocess.CalledProcessError(res.returncode, cmd, res.stdout, res.stderr)
-        return res
-    else:
-        return subprocess.run(cmd, check=check, env=env)
+            sys.stderr.write(res.stderr[:2000] + ("\n[rp] ... (stderr truncated)\n" if len(res.stderr) > 2000 else "\n"))
+    return res
 
 # ---------- Diagnostics ----------
 def aws_diag():
     try:
-        log("AWS diagnostics (set AWS_DIAG=1 to enable) ...")
-        run(["aws", "--version"], check=False)
-        run(["aws", "sts", "get-caller-identity"], capture=True)
+        _run(["aws", "--version"], capture=True)
+        _run(["aws", "sts", "get-caller-identity"], capture=True)
         if S3_BUCKET:
-            run(["aws", "s3", "ls", f"s3://{S3_BUCKET}/{S3_PREFIX}", "--region", AWS_REGION], capture=True)
-        else:
-            log("S3_BUCKET not set; skipping bucket list.")
-    except subprocess.CalledProcessError as e:
+            _run(["aws", "s3", "ls", f"s3://{S3_BUCKET}/{S3_PREFIX}", "--region", AWS_REGION], capture=True)
+    except Exception as e:
         log(f"[diag][ERROR] {e}")
 
 # ---------- Cold start: ensure model cache ----------
@@ -97,12 +85,34 @@ def ensure_models_cached():
     if missing == 0:
         log("all manifest files present in cache")
 
-# ---------- Run a single ComfyUI workflow ----------
+# ---------- Execute Comfy (robust entrypoint + flag fallback) ----------
+def _run_with_alt_flags(cmd_base, env):
+    """
+    Try command first with --output-directory, then retry with --output-path
+    if exit code == 2 (likely argparse error). Return the final CompletedProcess.
+    """
+    def _exec(cmd):
+        t0 = time.time()
+        res = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        log(f"ran: {' '.join(cmd[:3])} ... -> rc={res.returncode} in {time.time()-t0:.2f}s")
+        if res.stdout:
+            sys.stdout.write(res.stdout[:2000] + ("\n[rp] ... (stdout truncated)\n" if len(res.stdout) > 2000 else "\n"))
+        if res.stderr:
+            sys.stderr.write(res.stderr[:2000] + ("\n[rp] ... (stderr truncated)\n" if len(res.stderr) > 2000 else "\n"))
+        return res
+
+    res = _exec(cmd_base)
+    if res.returncode == 2 and "--output-directory" in cmd_base:
+        alt = [("--output-path" if x == "--output-directory" else x) for x in cmd_base]
+        log("[rp] retrying with --output-path")
+        res = _exec(alt)
+    return res
+
 def run_comfy_workflow(workflow_json: dict) -> dict:
     wf_path = COMFY_REPO / "input_workflow.json"
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Clean old files (don’t nuke subdirs)
+    # Clean previous files in OUT_DIR (non-recursive)
     for p in OUT_DIR.glob("*"):
         try:
             if p.is_file():
@@ -116,25 +126,32 @@ def run_comfy_workflow(workflow_json: dict) -> dict:
     env = os.environ.copy()
     env["COMFYUI_MODEL_DIR"] = str(MODELS_DIR)
 
-    # Execute ComfyUI once via execute.py (headless)
-    cmd = [
-        PY,
-        str(COMFY_REPO / "execute.py"),
-        "--workflow", str(wf_path),
-        "--output-directory", str(OUT_DIR),
-    ]
+    exec_py = COMFY_REPO / "execute.py"
+    main_py = COMFY_REPO / "main.py"
 
-    t = time.time()
-    res = subprocess.run(cmd, capture_output=True, text=True, env=env)
-    log(f"execute.py finished with code {res.returncode} in {time.time() - t:.2f}s")
+    candidates = []
+    if exec_py.exists():
+        candidates.append([PY, str(exec_py), "--workflow", str(wf_path), "--output-directory", str(OUT_DIR)])
+    if main_py.exists():
+        # keep headless if main.py wants to open a UI
+        candidates.append([PY, str(main_py), "--workflow", str(wf_path), "--output-directory", str(OUT_DIR), "--disable-auto-launch"])
+    # module runner fallback (newer ComfyUI trees)
+    candidates.append([PY, "-m", "comfy.cli", "--workflow", str(wf_path), "--output-directory", str(OUT_DIR)])
 
-    if res.stdout:
-        sys.stdout.write(res.stdout[:2000] + ("\n[rp] ... (stdout truncated)\n" if len(res.stdout) > 2000 else "\n"))
-    if res.stderr:
-        sys.stderr.write(res.stderr[:2000] + ("\n[rp] ... (stderr truncated)\n" if len(res.stderr) > 2000 else "\n"))
+    last = None
+    for cmd in candidates:
+        log(f"trying runner: {' '.join(cmd[:3])} ...")
+        last = _run_with_alt_flags(cmd, env)
+        if last.returncode == 0:
+            break
 
-    if res.returncode != 0:
-        raise subprocess.CalledProcessError(res.returncode, cmd, res.stdout, res.stderr)
+    if last is None or last.returncode != 0:
+        raise subprocess.CalledProcessError(
+            last.returncode if last else -1,
+            "runner",
+            last.stdout if last else "",
+            last.stderr if last else "no runner succeeded"
+        )
 
     # Collect images
     images = sorted(
@@ -149,7 +166,7 @@ def run_comfy_workflow(workflow_json: dict) -> dict:
     log(f"collected {len(payload)} image(s) from {OUT_DIR}")
     return {"images": payload}
 
-# ---------- Boot logs ----------
+# ---------- Boot ----------
 log(f"boot: image_version={IMAGE_VERSION}")
 log(f"boot: model_dir={MODELS_DIR}")
 log(f"boot: out_dir={OUT_DIR}")
@@ -160,15 +177,14 @@ log(f"boot: env AWS_SECRET_ACCESS_KEY present? {'AWS_SECRET_ACCESS_KEY' in os.en
 if ENABLE_AWS_DIAG:
     aws_diag()
 
-# ---------- Cold start prep ----------
-t_start_sync = time.time()
+# Cold start sync (non-fatal if it fails; handler will still return error details)
 try:
+    t_sync = time.time()
     ensure_models_cached()
-    log(f"model cache check/sync took {time.time() - t_start_sync:.2f}s")
+    log(f"model cache check/sync took {time.time() - t_sync:.2f}s")
 except Exception as e:
-    log(f"[startup][FATAL] model sync failed: {e}")
-    # Don’t crash the process—let the handler return error details.
-    # (If you prefer hard-fail, re-raise here.)
+    log(f"[startup][WARN] model sync problem: {e}")
+
 # ---------- Handler ----------
 def handler(event):
     log(f"handler: event keys = {list((event or {}).keys())}")
@@ -186,13 +202,13 @@ def handler(event):
     except subprocess.CalledProcessError as e:
         log(f"[handler][ERROR] subprocess failed: code={e.returncode}")
         if e.stderr:
-            sys.stderr.write(e.stderr[:2000] + ("\n[rp] ... (stderr truncated)\n" if len(e.stderr) > 2000 else "\n"))
+            sys.stderr.write(e.stderr[:4000] + ("\n[rp] ... (stderr truncated)\n" if len(e.stderr) > 4000 else "\n"))
         return {"error": f"subprocess failed: {e}"}
     except Exception as e:
         log(f"[handler][ERROR] {type(e).__name__}: {e}")
         return {"error": f"{type(e).__name__}: {e}"}
 
-# ---------- Start serverless loop ----------
+# ---------- Serverless loop ----------
 if __name__ == "__main__":
     log("starting runpod serverless loop ...")
     runpod.serverless.start({"handler": handler})
