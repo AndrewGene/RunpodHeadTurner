@@ -3,7 +3,7 @@
 # =========================
 FROM runpod/base:0.6.2-cuda12.1.0 AS comfyui-base
 
-ARG IMAGE_VERSION=v6.0
+ARG IMAGE_VERSION=v6.1
 ENV IMAGE_VERSION=${IMAGE_VERSION}
 
 # System deps
@@ -57,8 +57,18 @@ RUN . .venv/bin/activate && \
 # RunPod SDK (required for Queue endpoints)
 RUN . .venv/bin/activate && pip install --no-cache-dir runpod
 
-# Make 'comfy' importable for `python -m comfy.cli` fallback
-RUN . .venv/bin/activate && pip install --no-cache-dir -e /workspace/ComfyUI
+# Make 'comfy' importable WITHOUT packaging:
+# 1) Add repo to PYTHONPATH at runtime
+ENV PYTHONPATH="/workspace/ComfyUI:${PYTHONPATH}"
+# 2) Also drop a .pth file into the venv's site-packages so the venv python sees it
+RUN . .venv/bin/activate && python - <<'PY'
+import site, os, sys
+sp = next(p for p in site.getsitepackages() if p.endswith('site-packages'))
+pth = os.path.join(sp, 'comfyui_repo.pth')
+with open(pth, 'w') as f:
+    f.write('/workspace/ComfyUI\n')
+print('wrote', pth, 'pointing to /workspace/ComfyUI', file=sys.stderr)
+PY
 
 # Clean pip caches
 RUN rm -rf /root/.cache/pip /root/.cache
