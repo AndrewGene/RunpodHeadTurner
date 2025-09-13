@@ -31,7 +31,7 @@ jobs:
       - name: Derive tags
         id: meta
         run: |
-          TAG=v6.6
+          TAG=v6.7
           echo "TAG=${TAG}" >> $GITHUB_OUTPUT
           echo "LATEST=true" >> $GITHUB_OUTPUT
 
@@ -43,9 +43,7 @@ jobs:
           platforms: linux/amd64
           tags: |
             docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.TAG }}
-            docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:latest
-          build-args: |
-            IMAGE_VERSION=${{ steps.meta.outputs.TAG }}
+            docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:latest          
           cache-from: type=registry,ref=docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:buildcache
           cache-to: type=registry,ref=docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
 

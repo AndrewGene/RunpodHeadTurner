@@ -3,8 +3,6 @@
 # =========================
 FROM runpod/base:0.6.2-cuda12.1.0 AS comfyui-base
 
-ARG IMAGE_VERSION=v6.4
-ENV IMAGE_VERSION=${IMAGE_VERSION}
 
 # System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -23,6 +21,8 @@ RUN wget -q https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -O /tmp/aws
 WORKDIR /workspace
 RUN git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git
 WORKDIR /workspace/ComfyUI
+# pin to a known-good commit (replace with your chosen SHA)
+RUN git fetch --depth=1 origin <COMMIT_SHA> && git checkout <COMMIT_SHA>
 
 # venv
 RUN python3 -m venv .venv
@@ -78,6 +78,9 @@ RUN rm -rf /root/.cache/pip /root/.cache
 # Stage 2: app (tiny, fast rebuilds)
 # =========================
 FROM comfyui-base AS app
+
+ARG IMAGE_VERSION=v6.4
+ENV IMAGE_VERSION=${IMAGE_VERSION}
 
 # Runtime env (models + outputs on the attached Network Volume)
 ENV RUNTIME_DOWNLOADS="/runpod-volume"
