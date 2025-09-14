@@ -11,7 +11,7 @@ concurrency:
 
 env:
   IMAGE_NAME: comfyui-worker
-  TAG: v7.7
+  TAG: v7.8
 
 jobs:
   build:

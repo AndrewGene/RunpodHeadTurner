@@ -1,7 +1,0 @@
-- name: Kill buildkit containers (best effort)
-  run: |
-    docker ps -a || true
-    docker stop $(docker ps -aq --filter "name=buildx_buildkit") 2>/dev/null || true
-    docker rm -fv $(docker ps -aq --filter "name=buildx_buildkit") 2>/dev/null || true
-    docker buildx rm --all-inactive --force || true
-    docker system prune -af || true
